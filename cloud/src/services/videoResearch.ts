@@ -325,6 +325,55 @@ export async function transcribeWithGemini(
   throw new PipelineError("PROVIDER", `Gemini could not transcribe the video: ${failures.join("; ").slice(0, 300)}`);
 }
 
+/**
+ * Like transcribeWithGemini, but asks Gemini for timed lines so clip moments can be picked.
+ * Gemini's timestamps are approximate, so clip cuts made from them should be checked by eye.
+ */
+export async function transcribeWithGeminiTimed(
+  videoId: string,
+  client: GeminiClient = new GoogleGenAI({ apiKey: requireEnv("GEMINI_API_KEY") }),
+): Promise<{ language: string; segments: TimedSegment[] }> {
+  const failures: string[] = [];
+  for (const model of geminiModels()) {
+    try {
+      const response = await client.models.generateContent({
+        model,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { fileData: { fileUri: `https://www.youtube.com/watch?v=${videoId}`, mimeType: "video/*" } },
+              {
+                text:
+                  "Transcribe everything that is said in this video, in the language that is spoken, as short timed lines of one sentence or phrase each. " +
+                  'Answer with JSON: {"language": "<ISO 639-1 code>", "segments": [{"start": <seconds from the start of the video>, "end": <seconds>, "text": "<what is said>"}]}. ' +
+                  "Times must be numbers in seconds, in increasing order, and match the video as closely as possible. No speaker labels.",
+              },
+            ],
+          },
+        ],
+        config: { responseMimeType: "application/json", mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW },
+      });
+      const parsed = parseJsonText(response.text) as { language?: unknown; segments?: unknown };
+      const raw = Array.isArray(parsed.segments) ? (parsed.segments as Array<Record<string, unknown>>) : [];
+      const segments: TimedSegment[] = [];
+      for (const item of raw) {
+        const start = Number(item.start);
+        const end = Number(item.end);
+        const text = typeof item.text === "string" ? item.text.replace(/\s+/g, " ").trim() : "";
+        if (!text || !Number.isFinite(start) || start < 0) continue;
+        segments.push({ start, end: Number.isFinite(end) && end > start ? end : start + 3, text });
+      }
+      segments.sort((a, b) => a.start - b.start);
+      if (!segments.length) throw new Error("no timed lines");
+      return { language: typeof parsed.language === "string" && parsed.language ? parsed.language : "auto", segments };
+    } catch (error) {
+      failures.push(`${model}: ${errorMessage(error)}`);
+    }
+  }
+  throw new PipelineError("PROVIDER", `Gemini could not transcribe the video with timings: ${failures.join("; ").slice(0, 300)}`);
+}
+
 const base = (code: string) => code.toLowerCase().split("-")[0];
 
 /**
@@ -395,7 +444,18 @@ export function timedTextToSegments(xml: string): TimedSegment[] {
 /** The source-language transcript with timings, for picking clip moments. Not cached. */
 export async function getTimedTranscript(videoId: string): Promise<{ language: string; segments: TimedSegment[] }> {
   if (!VIDEO_ID.test(videoId)) throw new PipelineError("CONFLICT", "Invalid video id.");
-  const { track } = pickTrack(await fetchCaptionTracks(videoId), "");
+  let tracks: CaptionTrack[];
+  try {
+    tracks = await fetchCaptionTracks(videoId);
+  } catch (error) {
+    if (!(error instanceof TranscriptError && error.reason === "BLOCKED") || !process.env.GEMINI_API_KEY) throw error;
+    try {
+      return await transcribeWithGeminiTimed(videoId);
+    } catch (aiError) {
+      throw new TranscriptError("BLOCKED", `${error.message} The AI fallback failed too: ${errorMessage(aiError)}`);
+    }
+  }
+  const { track } = pickTrack(tracks, "");
   const url = new URL(track.baseUrl);
   url.searchParams.delete("fmt");
   const res = await fetch(url, { signal: AbortSignal.timeout(20_000) }).catch((error: unknown) => {
@@ -420,41 +480,21 @@ export async function getTranscript(videoId: string, language = "", { refresh = 
   try {
     tracks = await fetchCaptionTracks(videoId);
   } catch (error) {
-    if (!process.env.GEMINI_API_KEY) throw error;
+    if (!(error instanceof TranscriptError && error.reason === "BLOCKED") || !process.env.GEMINI_API_KEY) throw error;
     let ai: { language: string; text: string };
     try {
       ai = await transcribeWithGemini(videoId, language);
     } catch (aiError) {
-      throw new TranscriptError(
-        "BLOCKED",
-        `${errorMessage(error)} The AI fallback failed too: ${errorMessage(aiError)}`,
-      );
+      throw new TranscriptError("BLOCKED", `${error.message} The AI fallback failed too: ${errorMessage(aiError)}`);
     }
     await prisma.researchTranscript.upsert({
       where: { videoId_language: { videoId, language } },
-      create: {
-        videoId,
-        language,
-        actualLang: ai.language,
-        translated: false,
-        text: ai.text,
-      },
-      update: {
-        actualLang: ai.language,
-        translated: false,
-        text: ai.text,
-        fetchedAt: new Date(),
-      },
+      create: { videoId, language, actualLang: ai.language, translated: false, text: ai.text },
+      update: { actualLang: ai.language, translated: false, text: ai.text, fetchedAt: new Date() },
     });
-    return {
-      videoId,
-      language: ai.language,
-      translated: false,
-      text: ai.text,
-      cached: false,
-      source: "ai",
-    };
+    return { videoId, language: ai.language, translated: false, text: ai.text, cached: false, source: "ai" };
   }
+
   const { track, translateTo } = pickTrack(tracks, language);
   const url = new URL(track.baseUrl);
   url.searchParams.delete("fmt");
