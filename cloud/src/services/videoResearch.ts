@@ -420,21 +420,41 @@ export async function getTranscript(videoId: string, language = "", { refresh = 
   try {
     tracks = await fetchCaptionTracks(videoId);
   } catch (error) {
-    if (!(error instanceof TranscriptError && error.reason === "BLOCKED") || !process.env.GEMINI_API_KEY) throw error;
+    if (!process.env.GEMINI_API_KEY) throw error;
     let ai: { language: string; text: string };
     try {
       ai = await transcribeWithGemini(videoId, language);
     } catch (aiError) {
-      throw new TranscriptError("BLOCKED", `${error.message} The AI fallback failed too: ${errorMessage(aiError)}`);
+      throw new TranscriptError(
+        "BLOCKED",
+        `${errorMessage(error)} The AI fallback failed too: ${errorMessage(aiError)}`,
+      );
     }
     await prisma.researchTranscript.upsert({
       where: { videoId_language: { videoId, language } },
-      create: { videoId, language, actualLang: ai.language, translated: false, text: ai.text },
-      update: { actualLang: ai.language, translated: false, text: ai.text, fetchedAt: new Date() },
+      create: {
+        videoId,
+        language,
+        actualLang: ai.language,
+        translated: false,
+        text: ai.text,
+      },
+      update: {
+        actualLang: ai.language,
+        translated: false,
+        text: ai.text,
+        fetchedAt: new Date(),
+      },
     });
-    return { videoId, language: ai.language, translated: false, text: ai.text, cached: false, source: "ai" };
+    return {
+      videoId,
+      language: ai.language,
+      translated: false,
+      text: ai.text,
+      cached: false,
+      source: "ai",
+    };
   }
-
   const { track, translateTo } = pickTrack(tracks, language);
   const url = new URL(track.baseUrl);
   url.searchParams.delete("fmt");
