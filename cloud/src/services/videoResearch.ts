@@ -220,6 +220,13 @@ const PLAYER_CLIENTS = [
 
 type PlayerClient = (typeof PLAYER_CLIENTS)[number];
 
+/**
+ * Messages YouTube gives when it refuses this client or this server (an outdated client version,
+ * or a bot check). They are not about the video itself, so they count as BLOCKED: the next client
+ * is tried, and finally the Gemini fallback in getTranscript.
+ */
+const CLIENT_REFUSED = /no longer supported|not supported in this application|confirm you.?re not a bot|not a bot/i;
+
 async function fetchCaptionTracksWith(videoId: string, player: PlayerClient): Promise<CaptionTrack[]> {
   let res: Response;
   try {
@@ -242,12 +249,13 @@ async function fetchCaptionTracksWith(videoId: string, player: PlayerClient): Pr
     captions?: { playerCaptionsTracklistRenderer?: { captionTracks?: CaptionTrack[] } };
   };
   const status = body.playabilityStatus?.status;
-  if (status === "LOGIN_REQUIRED" && /bot/i.test(body.playabilityStatus?.reason ?? "")) {
-    throw new TranscriptError("BLOCKED", "YouTube asked this server to prove it is not a bot. Try again later.");
+  const reason = body.playabilityStatus?.reason ?? "";
+  if (CLIENT_REFUSED.test(reason)) {
+    throw new TranscriptError("BLOCKED", `YouTube refused this transcript request (${reason.slice(0, 120)}).`);
   }
   if (status && status !== "OK") {
     // Embedded clients are refused for videos that disallow embedding; another client may still work.
-    throw new TranscriptError(status === "UNPLAYABLE" ? "BLOCKED" : "UNAVAILABLE", body.playabilityStatus?.reason ?? "Video unavailable or private.");
+    throw new TranscriptError(status === "UNPLAYABLE" ? "BLOCKED" : "UNAVAILABLE", reason || "Video unavailable or private.");
   }
   const tracks = body.captions?.playerCaptionsTracklistRenderer?.captionTracks;
   if (!tracks?.length) throw new TranscriptError("DISABLED", "This video has no captions.");
